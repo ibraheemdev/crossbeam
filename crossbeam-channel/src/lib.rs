@@ -334,6 +334,7 @@
     rust_2018_idioms,
     unreachable_pub
 )]
+#![allow(dead_code, unused)]
 #![cfg_attr(not(feature = "std"), no_std)]
 
 use cfg_if::cfg_if;

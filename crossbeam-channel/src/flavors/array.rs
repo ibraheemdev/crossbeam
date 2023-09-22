@@ -358,6 +358,8 @@ impl<T> Channel<T> {
             }
 
             Context::with(|cx| {
+                // TODO: handle waking thread transition
+
                 // Prepare for blocking until a receiver wakes us up.
                 let oper = Operation::hook(token);
                 self.senders.register(oper, cx);

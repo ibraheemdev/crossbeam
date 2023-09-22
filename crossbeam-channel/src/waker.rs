@@ -1,7 +1,7 @@
 //! Waking mechanism for threads blocked on channel operations.
 
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::thread::{self, ThreadId};
 
@@ -178,9 +178,24 @@ pub(crate) struct SyncWaker {
     /// The inner `Waker`.
     inner: Mutex<Waker>,
 
-    /// `true` if the waker is empty.
-    is_empty: AtomicBool,
+    /// The state of the waker.
+    state: AtomicU8,
 }
+
+// A thread can be notified to become the "waking thread".
+const PENDING: u8 = 0;
+
+// The first thread to consume
+// this signal becomes the new waking thread.
+const SIGNALED: u8 = 1;
+
+// There is an active waking thread.
+// No other thread should be woken up except through a waking
+// thread transition.
+const WAKING: u8 = 2;
+
+/// `true` if the waker is empty.
+const IS_EMPTY: u8 = 0x80;
 
 impl SyncWaker {
     /// Creates a new `SyncWaker`.
@@ -188,7 +203,15 @@ impl SyncWaker {
     pub(crate) fn new() -> Self {
         SyncWaker {
             inner: Mutex::new(Waker::new()),
-            is_empty: AtomicBool::new(true),
+            state: AtomicU8::new(IS_EMPTY),
+        }
+    }
+
+    fn set_empty(&self, is_empty: bool) {
+        if is_empty {
+            self.state.fetch_or(IS_EMPTY, Ordering::SeqCst);
+        } else {
+            self.state.fetch_and(!IS_EMPTY, Ordering::SeqCst);
         }
     }
 
@@ -197,10 +220,7 @@ impl SyncWaker {
     pub(crate) fn register(&self, oper: Operation, cx: &Context) {
         let mut inner = self.inner.lock().unwrap();
         inner.register(oper, cx);
-        self.is_empty.store(
-            inner.selectors.is_empty() && inner.observers.is_empty(),
-            Ordering::SeqCst,
-        );
+        self.set_empty(inner.selectors.is_empty() && inner.observers.is_empty());
     }
 
     /// Unregisters an operation previously registered by the current thread.
@@ -208,25 +228,39 @@ impl SyncWaker {
     pub(crate) fn unregister(&self, oper: Operation) -> Option<Entry> {
         let mut inner = self.inner.lock().unwrap();
         let entry = inner.unregister(oper);
-        self.is_empty.store(
-            inner.selectors.is_empty() && inner.observers.is_empty(),
-            Ordering::SeqCst,
-        );
+        self.set_empty(inner.selectors.is_empty() && inner.observers.is_empty());
         entry
     }
 
     /// Attempts to find one thread (not the current one), select its operation, and wake it up.
     #[inline]
-    pub(crate) fn notify(&self) {
-        if !self.is_empty.load(Ordering::SeqCst) {
+    pub(crate) fn notify(&self, is_waking: bool) {
+        if self.state.load(Ordering::SeqCst) & IS_EMPTY == 0 {
             let mut inner = self.inner.lock().unwrap();
-            if !self.is_empty.load(Ordering::SeqCst) {
-                inner.try_select();
-                inner.notify();
-                self.is_empty.store(
-                    inner.selectors.is_empty() && inner.observers.is_empty(),
-                    Ordering::SeqCst,
-                );
+            let mut state = self.state.load(Ordering::SeqCst);
+
+            loop {
+                if state & IS_EMPTY != 0 {
+                    return;
+                }
+
+                let state = state & (!IS_EMPTY);
+                if state != PENDING && !is_waking {
+                    return;
+                }
+
+                let new_state = SIGNALED & !IS_EMPTY;
+
+                if self
+                    .state
+                    .compare_exchange(state, new_state, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    inner.try_select();
+                    inner.notify();
+                    self.set_empty(inner.selectors.is_empty() && inner.observers.is_empty());
+                    return;
+                }
             }
         }
     }
@@ -236,10 +270,7 @@ impl SyncWaker {
     pub(crate) fn watch(&self, oper: Operation, cx: &Context) {
         let mut inner = self.inner.lock().unwrap();
         inner.watch(oper, cx);
-        self.is_empty.store(
-            inner.selectors.is_empty() && inner.observers.is_empty(),
-            Ordering::SeqCst,
-        );
+        self.set_empty(inner.selectors.is_empty() && inner.observers.is_empty());
     }
 
     /// Unregisters an operation waiting to be ready.
@@ -247,10 +278,7 @@ impl SyncWaker {
     pub(crate) fn unwatch(&self, oper: Operation) {
         let mut inner = self.inner.lock().unwrap();
         inner.unwatch(oper);
-        self.is_empty.store(
-            inner.selectors.is_empty() && inner.observers.is_empty(),
-            Ordering::SeqCst,
-        );
+        self.set_empty(inner.selectors.is_empty() && inner.observers.is_empty());
     }
 
     /// Notifies all threads that the channel is disconnected.
@@ -258,17 +286,14 @@ impl SyncWaker {
     pub(crate) fn disconnect(&self) {
         let mut inner = self.inner.lock().unwrap();
         inner.disconnect();
-        self.is_empty.store(
-            inner.selectors.is_empty() && inner.observers.is_empty(),
-            Ordering::SeqCst,
-        );
+        self.set_empty(inner.selectors.is_empty() && inner.observers.is_empty());
     }
 }
 
 impl Drop for SyncWaker {
     #[inline]
     fn drop(&mut self) {
-        debug_assert!(self.is_empty.load(Ordering::SeqCst));
+        debug_assert!(self.state.load(Ordering::SeqCst) & IS_EMPTY == 0);
     }
 }
 
